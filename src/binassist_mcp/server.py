@@ -8,7 +8,7 @@ and comprehensive Binary Ninja integration.
 import warnings
 from contextlib import asynccontextmanager
 from threading import Event, Thread
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List, Optional, Union
 
 import asyncio
 from hypercorn.config import Config as HypercornConfig
@@ -496,6 +496,11 @@ class BinAssistMCPServer:
             "readOnlyHint": False,
             "idempotentHint": True,
             "openWorldHint": False
+        }
+        FILE_WRITE_ANNOTATIONS = {
+            "readOnlyHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True
         }
 
         def _check_analysis_guard(context_manager: BinAssistMCPBinaryContextManager,
@@ -1305,6 +1310,64 @@ class BinAssistMCPServer:
             binary_view = context_manager.get_binary(filename)
             tools = BinAssistMCPTools(binary_view)
             return tools.search_bytes(pattern, start_address, max_results)
+
+        @mcp.tool(annotations=MODIFY_ANNOTATIONS)
+        def patch_bytes(filename: str, address: str, bytes: Union[str, List[int]], ctx: Context,
+                        clear_code_units: bool = False) -> dict:
+            """Patch raw bytes in the binary at a given address.
+
+            Args:
+                filename: Name of the binary file
+                address: Address to patch (hex string or symbol name)
+                bytes: Bytes to write, as a hex string (e.g. '90 90') or integer array
+                clear_code_units: Accepted for parity with other clients; ignored by Binary Ninja
+
+            Returns:
+                Dictionary with patch range and before/after bytes
+            """
+            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
+            binary_view = context_manager.get_binary(filename)
+            tools = BinAssistMCPTools(binary_view)
+            return tools.patch_bytes(address, bytes, clear_code_units)
+
+        @mcp.tool(annotations=MODIFY_ANNOTATIONS)
+        def assemble_code(filename: str, address: str, code: str, ctx: Context,
+                          patch: bool = True, clear_code_units: bool = False) -> dict:
+            """Assemble instruction text at an address and optionally patch it.
+
+            Args:
+                filename: Name of the binary file
+                address: Address to assemble at (hex string or symbol name)
+                code: Single instruction or newline-separated assembly block
+                patch: If true, write assembled bytes into the binary
+                clear_code_units: Accepted for parity with other clients; ignored by Binary Ninja
+
+            Returns:
+                Dictionary with assembled bytes and optional before/after patch details
+            """
+            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
+            binary_view = context_manager.get_binary(filename)
+            tools = BinAssistMCPTools(binary_view)
+            return tools.assemble_code(address, code, patch, clear_code_units)
+
+        @mcp.tool(annotations=FILE_WRITE_ANNOTATIONS)
+        def export_program(filename: str, output_path: str, ctx: Context,
+                           format: str = "binary", overwrite: bool = False) -> dict:
+            """Export the current binary or Binary Ninja database to disk.
+
+            Args:
+                filename: Name of the binary file
+                output_path: Destination path on the host filesystem
+                format: 'binary' for a patched executable or 'bndb' for a database
+                overwrite: Whether to replace an existing output file
+
+            Returns:
+                Dictionary with export status and output metadata
+            """
+            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
+            binary_view = context_manager.get_binary(filename)
+            tools = BinAssistMCPTools(binary_view)
+            return tools.export_program(output_path, format, overwrite)
 
         @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
         def get_basic_blocks(filename: str, function_name_or_address: str, ctx: Context) -> list:

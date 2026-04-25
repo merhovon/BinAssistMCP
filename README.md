@@ -10,7 +10,7 @@ BinAssistMCP is a powerful bridge between Binary Ninja and Large Language Models
 
 - **MCP 2025-11-25 Compliant**: Full support for tool annotations, resources, and prompts
 - **Dual Transport Support**: SSE (Server-Sent Events) and Streamable HTTP transports
-- **39 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
+- **44 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
 - **8 MCP Resources**: Browsable, cacheable binary metadata
 - **7 Guided Prompts**: Pre-built workflows for common reverse engineering tasks
 - **Multi-Binary Sessions**: Concurrent analysis of multiple binaries with intelligent context management
@@ -34,7 +34,7 @@ BinAssistMCP is a powerful bridge between Binary Ninja and Large Language Models
 ```
 src/binassist_mcp/
 ├── server.py        # FastMCP server - SSE/Streamable HTTP transport, tool registration
-├── tools.py         # Binary Ninja API wrapper - 39 MCP tools
+├── tools.py         # Binary Ninja API wrapper - 44 MCP tools
 ├── plugin.py        # Binary Ninja plugin integration
 ├── context.py       # Thread-safe multi-binary session management
 ├── config.py        # Pydantic configuration with Binary Ninja settings
@@ -50,9 +50,9 @@ __init__.py          # Plugin entry point (root level)
 
 ---
 
-## Tools (39 Total)
+## Tools (44 Total)
 
-BinAssistMCP provides 39 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
+BinAssistMCP provides 44 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
 
 ### Binary Management
 | Tool | Description |
@@ -60,6 +60,7 @@ BinAssistMCP provides 39 tools organized into functional categories. Tools inclu
 | `list_binaries` | List all loaded binary files |
 | `get_binary_info` | Check analysis status and metadata |
 | `update_analysis_and_wait` | Force analysis update and wait for completion |
+| `export_program` | Export the patched binary or Binary Ninja database to disk |
 
 ### Code Analysis (Consolidated)
 | Tool | Description |
@@ -125,6 +126,12 @@ BinAssistMCP provides 39 tools organized into functional categories. Tools inclu
 | `get_data_vars` | List all defined data variables |
 | `get_data_at` | Read and analyze raw data |
 | `search_bytes` | Search for byte patterns in binary |
+
+### Patching
+| Tool | Description |
+|------|-------------|
+| `patch_bytes` | Patch raw bytes in the binary at an address |
+| `assemble_code` | Assemble instruction text at an address and optionally patch it |
 
 ### Navigation & Bookmarks
 | Tool | Description |

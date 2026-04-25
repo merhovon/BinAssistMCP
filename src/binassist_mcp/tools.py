@@ -6,6 +6,7 @@ This module provides all the Binary Ninja integration tools.
 
 import functools
 import re
+import builtins
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 
@@ -190,6 +191,78 @@ class BinAssistMCPTools:
                 targets.append(target_func)
 
         return targets
+
+    def _parse_patch_bytes(self, value: Any) -> bytes:
+        """Parse bytes from a hex string or an integer array."""
+        if isinstance(value, str):
+            normalized = value.replace("0x", "").replace("0X", "")
+            normalized = re.sub(r"[,\s]", "", normalized)
+            if not normalized:
+                return b""
+            if len(normalized) % 2 != 0:
+                raise ValueError("hex string must contain an even number of characters")
+            try:
+                return builtins.bytes.fromhex(normalized)
+            except ValueError as e:
+                raise ValueError(f"invalid hex string: {value}") from e
+
+        if isinstance(value, (list, tuple)):
+            parsed = bytearray()
+            for index, item in enumerate(value):
+                if not isinstance(item, int):
+                    raise ValueError(f"array element at index {index} is not an integer")
+                if item < 0 or item > 255:
+                    raise ValueError(f"array element at index {index} out of range (0-255): {item}")
+                parsed.append(item)
+            return builtins.bytes(parsed)
+
+        raise ValueError("bytes must be a hex string or integer array")
+
+    def _format_hex(self, data: bytes) -> str:
+        """Format bytes as space-separated uppercase hex."""
+        return " ".join(f"{b:02X}" for b in data)
+
+    def _patch_bytes_impl(self, addr: int, patch_data: bytes, clear_code_units: bool = False) -> Dict[str, Any]:
+        """Write raw bytes and return before/after details."""
+        if not patch_data:
+            raise ValueError("No bytes provided to patch")
+
+        end_addr = addr + len(patch_data) - 1
+        if addr < self.bv.start or end_addr > self.bv.end:
+            raise ValueError(
+                f"Patch range is outside binary bounds: {hex(addr)} - {hex(end_addr)} "
+                f"(bounds {hex(self.bv.start)} - {hex(self.bv.end)})"
+            )
+
+        before = self.bv.read(addr, len(patch_data))
+        if before is None or len(before) != len(patch_data):
+            raise ValueError(f"Failed reading original bytes at {hex(addr)}")
+
+        written = self.bv.write(addr, patch_data)
+        if written != len(patch_data):
+            raise ValueError(f"Patch wrote {written} of {len(patch_data)} byte(s)")
+
+        return {
+            "status": "patched",
+            "address": hex(addr),
+            "end_address": hex(end_addr),
+            "size": len(patch_data),
+            "before": self._format_hex(before),
+            "after": self._format_hex(patch_data),
+            "clear_code_units": clear_code_units,
+        }
+
+    def _get_arch_for_address(self, addr: int):
+        """Resolve the best Binary Ninja architecture for an address."""
+        funcs = self.bv.get_functions_containing(addr)
+        if funcs:
+            arch = getattr(funcs[0], "arch", None)
+            if arch:
+                return arch
+        arch = getattr(self.bv, "arch", None)
+        if arch:
+            return arch
+        raise ValueError(f"Could not determine architecture at {hex(addr)}")
         
     # Core analysis tools
     @handle_exceptions
@@ -2688,6 +2761,123 @@ class BinAssistMCPTools:
             current_addr = found + 1
 
         return results
+
+    @handle_exceptions
+    @require_binja
+    def patch_bytes(self, address: str, byte_values: Any, clear_code_units: bool = False) -> Dict[str, Any]:
+        """Patch raw bytes in the binary at a given address.
+
+        Args:
+            address: Address in hex format or symbol name
+            byte_values: Hex string (e.g. '90 90') or integer array (e.g. [144, 144])
+            clear_code_units: Accepted for cross-client parity; Binary Ninja writes bytes directly
+
+        Returns:
+            Dictionary with patch range and before/after bytes
+        """
+        addr = self._resolve_symbol(address)
+        if addr is None:
+            raise ValueError(f"Invalid address: {address}")
+
+        patch_data = self._parse_patch_bytes(byte_values)
+        return self._patch_bytes_impl(addr, patch_data, clear_code_units)
+
+    @handle_exceptions
+    @require_binja
+    def assemble_code(self, address: str, code: str, patch: bool = True,
+                      clear_code_units: bool = False) -> Dict[str, Any]:
+        """Assemble instruction text at an address and optionally patch it.
+
+        Args:
+            address: Address in hex format or symbol name
+            code: Single instruction or multi-line assembly block
+            patch: If true, write assembled bytes into the BinaryView
+            clear_code_units: Accepted for cross-client parity; Binary Ninja writes bytes directly
+
+        Returns:
+            Dictionary with assembled bytes and optional before/after patch details
+        """
+        addr = self._resolve_symbol(address)
+        if addr is None:
+            raise ValueError(f"Invalid address: {address}")
+
+        lines = [line.strip() for line in code.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("No assembly instructions provided")
+
+        arch = self._get_arch_for_address(addr)
+        try:
+            assembled = arch.assemble("\n".join(lines), addr)
+        except Exception as e:
+            raise ValueError(f"Assembly failed at {hex(addr)}: {e}") from e
+
+        if not assembled:
+            raise ValueError("Assembler produced no bytes")
+
+        end_addr = addr + len(assembled) - 1
+        result = {
+            "status": "assembled",
+            "address": hex(addr),
+            "end_address": hex(end_addr),
+            "size": len(assembled),
+            "bytes": self._format_hex(assembled),
+            "instruction_lines": len(lines),
+            "architecture": getattr(arch, "name", str(arch)),
+            "patched": False,
+        }
+
+        if patch:
+            patch_result = self._patch_bytes_impl(addr, assembled, clear_code_units)
+            result.update({
+                "status": "assembled_and_patched",
+                "patched": True,
+                "before": patch_result["before"],
+                "after": patch_result["after"],
+                "clear_code_units": clear_code_units,
+            })
+
+        return result
+
+    @handle_exceptions
+    @require_binja
+    def export_program(self, output_path: str, format: str = "binary",
+                       overwrite: bool = False) -> Dict[str, Any]:
+        """Export the current BinaryView to disk.
+
+        Args:
+            output_path: Destination file path
+            format: 'binary' for the patched input file or 'bndb' for a Binary Ninja database
+            overwrite: Whether to overwrite an existing output file
+
+        Returns:
+            Dictionary with export status and output metadata
+        """
+        if not output_path or not str(output_path).strip():
+            raise ValueError("output_path is required")
+
+        destination = Path(output_path).expanduser()
+        if destination.exists() and not overwrite:
+            raise ValueError(f"Output file already exists: {destination} (set overwrite=True to replace it)")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        export_format = (format or "binary").lower()
+
+        if export_format == "binary":
+            success = self.bv.save(str(destination))
+        elif export_format == "bndb":
+            success = self.bv.create_database(str(destination))
+        else:
+            raise ValueError("Unsupported format. Use 'binary' or 'bndb'.")
+
+        if not success:
+            raise ValueError(f"Export failed for {destination}")
+
+        return {
+            "status": "exported",
+            "format": export_format,
+            "output_path": str(destination.resolve()),
+            "bytes_written": destination.stat().st_size if destination.exists() else None,
+        }
 
     @handle_exceptions
     @require_binja
