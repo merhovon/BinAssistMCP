@@ -24,32 +24,9 @@ In Binary Ninja, go to **Settings → Python** and configure:
 
 This ensures packages are installed to a user-writable location.
 
-## Step 2: Install pywin32 DLLs (Administrator Required)
-
-The `pywin32` package includes DLLs that must be accessible at runtime. Copy them to the Binary Ninja installation folder.
-
-Open **Command Prompt as Administrator** and run:
-
-```cmd
-copy "C:\Users\<username>\AppData\Roaming\Binary Ninja\python310\site-packages\pywin32_system32\*.dll" "C:\Program Files\Vector35\BinaryNinja\"
-```
-
-Or if pywin32 is in the Program Files site-packages:
-
-```cmd
-copy "C:\Program Files\Vector35\BinaryNinja\plugins\python\Lib\site-packages\pywin32_system32\*.dll" "C:\Program Files\Vector35\BinaryNinja\"
-```
-
-This copies `pythoncom310.dll` and `pywintypes310.dll` to a location on the DLL search path.
-
-## Step 3: Install Plugin Dependencies
+## Step 2: Install Plugin Dependencies
 
 Install all required packages to Binary Ninja's user site-packages using `--target`:
-
-**Install pywin32:**
-```cmd
-"C:\Program Files\Vector35\BinaryNinja\plugins\python\python.exe" -m pip install --target "C:\Users\<username>\AppData\Roaming\Binary Ninja\python310\site-packages" pywin32
-```
 
 **Install BinAssist dependencies:**
 ```cmd
@@ -61,22 +38,44 @@ Install all required packages to Binary Ninja's user site-packages using `--targ
 "C:\Program Files\Vector35\BinaryNinja\plugins\python\python.exe" -m pip install --target "C:\Users\<username>\AppData\Roaming\Binary Ninja\python310\site-packages" -r "C:\Users\<username>\AppData\Roaming\Binary Ninja\plugins\BinAssistMCP\requirements.txt"
 ```
 
+These requirements install `pywin32`; you do not need a separate `pip install pywin32` step.
+
 > **Note:** Replace `<username>` with your actual Windows username, or use `%APPDATA%` in the path (though `--target` may not expand environment variables).
+
+## Step 3: Copy pywin32 DLLs (Administrator Required)
+
+The `pywin32` package includes DLLs that must be accessible at runtime. After installing the dependencies, copy them to the Binary Ninja installation folder.
+
+Open **Command Prompt as Administrator** and run:
+
+```cmd
+copy "C:\Users\<username>\AppData\Roaming\Binary Ninja\python310\site-packages\pywin32_system32\*.dll" "C:\Program Files\Vector35\BinaryNinja\"
+```
+
+This copies `pythoncom310.dll` and `pywintypes310.dll` to a location on the DLL search path.
 
 ## Step 4: Restart Binary Ninja
 
-Close all Binary Ninja instances and restart. The plugins should now load correctly.
+Close all Binary Ninja instances and restart. Check **View > Log** to confirm the BinAssist and BinAssistMCP plugins loaded successfully.
 
-## Verification
+Manual import checks are usually only needed when the plugins fail to load.
 
-In Binary Ninja's Python console, verify the imports work:
+## Optional Troubleshooting Check
+
+If Binary Ninja reports an import error, run this in Binary Ninja's Python console:
 
 ```python
-import pywintypes
-print("pywintypes OK")
+try:
+    import pywintypes
+    print("pywintypes OK")
+except Exception as exc:
+    print(f"pywintypes failed: {exc}")
 
-import mcp
-print("mcp OK")
+try:
+    import mcp
+    print("mcp OK")
+except Exception as exc:
+    print(f"mcp failed: {exc}")
 ```
 
 ## Notes: pywin32 Path Fix (Already Applied - For Reference Only)
@@ -112,6 +111,7 @@ This code is already included in the plugin source.
 - Ensure the DLLs were copied to `C:\Program Files\Vector35\BinaryNinja\`
 - Verify the path fix is in `__init__.py` and runs before any mcp imports
 - Check that `win32\lib\pywintypes.py` exists in your site-packages
+- Reinstall the BinAssist and BinAssistMCP requirements if `pywin32_system32` is missing
 
 ### "Access is denied" when installing packages
 
