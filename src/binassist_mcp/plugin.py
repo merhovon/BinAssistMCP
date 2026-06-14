@@ -5,6 +5,7 @@ This module provides the Binary Ninja plugin interface with menu integration,
 settings management, and automatic server lifecycle management.
 """
 
+import atexit
 from typing import Optional
 
 from .logging import log, disable_external_logging
@@ -36,6 +37,8 @@ class BinAssistMCPPlugin:
         self.config: Optional[BinAssistMCPConfig] = None
         self.server: Optional[BinAssistMCPServer] = None
         self._settings_registered = False
+        self._shutdown_registered = False
+        self._shutdown_started = False
         
         if BINJA_AVAILABLE:
             self._initialize_plugin()
@@ -56,6 +59,7 @@ class BinAssistMCPPlugin:
             
             # Register plugin commands
             self._register_commands()
+            self._register_shutdown_hooks()
             
             # Auto-startup is handled via global event registration in __init__.py
                 
@@ -152,6 +156,26 @@ class BinAssistMCPPlugin:
             
         except Exception as e:
             log.log_error(f"Failed to register commands: {e}")
+
+    def _register_shutdown_hooks(self):
+        """Register shutdown hooks so server threads stop before host teardown."""
+        if self._shutdown_registered:
+            return
+
+        atexit.register(self.shutdown)
+        self._shutdown_registered = True
+
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app:
+                app.aboutToQuit.connect(self.shutdown)
+                log.log_info("Registered BinAssistMCP Qt shutdown hook")
+            else:
+                log.log_warn("QApplication instance unavailable; using atexit shutdown hook only")
+        except Exception as e:
+            log.log_warn(f"Failed to register Qt shutdown hook: {e}")
             
     def handle_auto_startup(self, binary_view):
         """Handle auto-startup when a binary is analyzed"""
@@ -256,6 +280,19 @@ class BinAssistMCPPlugin:
             error_msg = f"Error stopping server: {e}"
             log.log_error(error_msg)
             log.log_error(error_msg)
+
+    def shutdown(self):
+        """Stop the MCP server during Binary Ninja or Python shutdown."""
+        if self._shutdown_started:
+            return
+
+        self._shutdown_started = True
+        try:
+            if self.server and self.server.is_running():
+                log.log_info("BinAssistMCP shutdown requested; stopping server")
+                self.server.stop()
+        except Exception as e:
+            log.log_error(f"Error during BinAssistMCP shutdown: {e}")
             
     def _restart_server_command(self, bv):
         """Restart server command handler"""
@@ -334,5 +371,4 @@ def set_plugin_instance(plugin: BinAssistMCPPlugin):
 def get_plugin_instance() -> Optional[BinAssistMCPPlugin]:
     """Get the global plugin instance"""
     return _plugin_instance
-
 
