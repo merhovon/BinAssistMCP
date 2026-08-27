@@ -2261,6 +2261,44 @@ class BinAssistMCPTools:
             return [(getattr(line, "address", None), str(line)) for line in lines]
         return [(None, line) for line in str(il).splitlines()]
 
+    @staticmethod
+    def _get_il_if_available(func, level: str):
+        """Return already-loaded IL without asking Binary Ninja to generate it."""
+        return getattr(func, f"{level}_if_available", None)
+
+    def _get_instruction_aligned_disassembly(self, func) -> List[Any]:
+        """Render basic blocks at decoded instruction boundaries only."""
+        code_lines = []
+        seen_addresses = set()
+
+        for block in sorted(func.basic_blocks, key=lambda item: item.start):
+            address = block.start
+            architecture = getattr(block, "arch", None)
+
+            while address < block.end:
+                if address in seen_addresses:
+                    break
+                seen_addresses.add(address)
+
+                try:
+                    instruction_length = self.bv.get_instruction_length(address, architecture)
+                except TypeError:
+                    instruction_length = self.bv.get_instruction_length(address)
+
+                if not instruction_length:
+                    log.log_debug(
+                        f"Stopping disassembly at invalid instruction {hex(address)} "
+                        f"in function '{func.name}'"
+                    )
+                    break
+
+                disassembly = self.bv.get_disassembly(address)
+                if disassembly:
+                    code_lines.append((address, f"{hex(address)}: {disassembly}"))
+                address += instruction_length
+
+        return code_lines
+
     # ==================== CONSOLIDATED TOOLS ====================
     # These unified tools reduce tool count while maintaining functionality
 
@@ -2294,85 +2332,100 @@ class BinAssistMCPTools:
             "function": func.name,
             "address": hex(func.start),
             "format": format,
+            "actual_format": None,
+            "fallback_used": False,
             "code": None
         }
 
         if format == "decompile":
-            # Use existing decompile logic
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
-                code_lines = self._get_decompile_lines(func.hlil)
-            elif hasattr(func, 'mlil') and func.mlil:
+            hlil = self._get_il_if_available(func, "hlil")
+            mlil = self._get_il_if_available(func, "mlil")
+            llil = self._get_il_if_available(func, "llil")
+
+            if hlil:
+                code_lines = self._get_decompile_lines(hlil)
+                result["actual_format"] = "hlil"
+            elif mlil:
                 code_lines = [
                     (getattr(instr, "address", None), str(instr))
-                    for block in func.mlil
+                    for block in mlil
                     for instr in block
                 ]
+                result["actual_format"] = "mlil"
+            elif llil:
+                code_lines = [
+                    (instr.address, f"{hex(instr.address)}: {instr}")
+                    for block in llil
+                    for instr in block
+                ]
+                result["actual_format"] = "llil"
             else:
-                code_lines = []
-                for block in func.basic_blocks:
-                    for i in range(block.start, block.end):
-                        disasm = self.bv.get_disassembly(i)
-                        if disasm:
-                            code_lines.append((i, f"{hex(i)}: {disasm}"))
+                code_lines = self._get_instruction_aligned_disassembly(func)
+                result["actual_format"] = "disasm"
+
+            if result["actual_format"] != "hlil":
+                result["fallback_used"] = True
+                if result["actual_format"] == "disasm":
+                    replacement = "instruction-aligned disassembly"
+                else:
+                    replacement = f"already-loaded {result['actual_format']}"
+                result["note"] = (
+                    "Requested decompile output was unavailable; returned "
+                    f"{replacement} instead without triggering analysis"
+                )
             result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "hlil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
+            hlil = self._get_il_if_available(func, "hlil")
+            if hlil:
                 code_lines = []
-                for block in func.hlil:
+                for block in hlil:
                     for instr in block:
                         code_lines.append((getattr(instr, "address", None), str(instr)))
+                result["actual_format"] = "hlil"
             else:
                 code_lines = [(None, "HLIL not available for this function")]
             result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "mlil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'mlil') and func.mlil:
+            mlil = self._get_il_if_available(func, "mlil")
+            if mlil:
                 code_lines = []
-                for block in func.mlil:
+                for block in mlil:
                     for instr in block:
                         code_lines.append((getattr(instr, "address", None), str(instr)))
+                result["actual_format"] = "mlil"
             else:
                 code_lines = [(None, "MLIL not available for this function")]
             result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "llil":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'llil') and func.llil:
+            llil = self._get_il_if_available(func, "llil")
+            if llil:
                 code_lines = []
-                for block in func.llil:
+                for block in llil:
                     for instr in block:
                         code_lines.append((instr.address, f"{hex(instr.address)}: {instr}"))
+                result["actual_format"] = "llil"
             else:
                 code_lines = [(None, "LLIL not available for this function")]
             result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "disasm":
-            code_lines = []
-            for block in func.basic_blocks:
-                for i in range(block.start, block.end):
-                    disasm = self.bv.get_disassembly(i)
-                    if disasm:
-                        code_lines.append((i, f"{hex(i)}: {disasm}"))
+            code_lines = self._get_instruction_aligned_disassembly(func)
+            result["actual_format"] = "disasm"
             result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "pseudo_c":
-            func.analysis_skipped = False
-            self.bv.update_analysis_and_wait()
-            if hasattr(func, 'hlil') and func.hlil:
+            hlil = self._get_il_if_available(func, "hlil")
+            if hlil:
                 # Build pseudo-C representation
                 code_lines = []
-                for block in func.hlil:
+                for block in hlil:
                     for instr in block:
                         code_lines.append((getattr(instr, "address", None), f"    {instr}"))
                 code_lines.append((None, "}"))
+                result["actual_format"] = "pseudo_c"
                 result["code"] = self._format_code_with_context(func, code_lines, " {")
             else:
                 result["code"] = self._format_code_with_context(
