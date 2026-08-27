@@ -2215,6 +2215,52 @@ class BinAssistMCPTools:
             log.log_debug(f"Failed to get variable type: {e}")
             return "unknown"
 
+    def _format_function_signature(self, func) -> str:
+        """Render the current Binary Ninja function signature for code output."""
+        parameters = []
+        for index, parameter in enumerate(getattr(func, "parameter_vars", []) or []):
+            name = getattr(parameter, "name", None) or f"arg{index + 1}"
+            parameters.append(f"{self._get_variable_type_safe(func, parameter)} {name}")
+
+        parameter_text = ", ".join(parameters) if parameters else "void"
+        return_type = str(getattr(func, "return_type", None) or "void")
+        return f"{return_type} {func.name}({parameter_text})"
+
+    @staticmethod
+    def _normalize_inline_comment(comment: str) -> str:
+        """Keep multiline Binary Ninja comments readable on one code line."""
+        return " | ".join(part.strip() for part in str(comment).splitlines() if part.strip())
+
+    def _format_code_with_context(self, func, code_lines, signature_suffix: str = "") -> str:
+        """Add a function signature and Binary Ninja comments to rendered code lines."""
+        rendered = []
+        function_comment = getattr(func, "comment", None)
+        if function_comment:
+            rendered.extend(f"// {line}" for line in str(function_comment).splitlines())
+
+        rendered.append(f"{self._format_function_signature(func)}{signature_suffix}")
+
+        for address, text in code_lines:
+            line = str(text).rstrip()
+            if address is not None:
+                comment = self._get_comment_at(address)
+                if comment:
+                    normalized = self._normalize_inline_comment(comment)
+                    if normalized:
+                        line += f"  // {normalized}"
+            rendered.append(line)
+
+        return "\n".join(rendered)
+
+    @staticmethod
+    def _get_decompile_lines(il) -> List[Any]:
+        """Prefer structured HLIL lines so source addresses remain available."""
+        root = getattr(il, "root", None)
+        lines = getattr(root, "lines", None)
+        if lines is not None:
+            return [(getattr(line, "address", None), str(line)) for line in lines]
+        return [(None, line) for line in str(il).splitlines()]
+
     # ==================== CONSOLIDATED TOOLS ====================
     # These unified tools reduce tool count while maintaining functionality
 
@@ -2256,62 +2302,66 @@ class BinAssistMCPTools:
             func.analysis_skipped = False
             self.bv.update_analysis_and_wait()
             if hasattr(func, 'hlil') and func.hlil:
-                result["code"] = str(func.hlil)
+                code_lines = self._get_decompile_lines(func.hlil)
             elif hasattr(func, 'mlil') and func.mlil:
-                result["code"] = str(func.mlil)
+                code_lines = [
+                    (getattr(instr, "address", None), str(instr))
+                    for block in func.mlil
+                    for instr in block
+                ]
             else:
-                lines = []
+                code_lines = []
                 for block in func.basic_blocks:
                     for i in range(block.start, block.end):
                         disasm = self.bv.get_disassembly(i)
                         if disasm:
-                            lines.append(f"{hex(i)}: {disasm}")
-                result["code"] = "\n".join(lines)
+                            code_lines.append((i, f"{hex(i)}: {disasm}"))
+            result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "hlil":
             func.analysis_skipped = False
             self.bv.update_analysis_and_wait()
             if hasattr(func, 'hlil') and func.hlil:
-                lines = []
+                code_lines = []
                 for block in func.hlil:
                     for instr in block:
-                        lines.append(str(instr))
-                result["code"] = "\n".join(lines)
+                        code_lines.append((getattr(instr, "address", None), str(instr)))
             else:
-                result["code"] = "HLIL not available for this function"
+                code_lines = [(None, "HLIL not available for this function")]
+            result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "mlil":
             func.analysis_skipped = False
             self.bv.update_analysis_and_wait()
             if hasattr(func, 'mlil') and func.mlil:
-                lines = []
+                code_lines = []
                 for block in func.mlil:
                     for instr in block:
-                        lines.append(str(instr))
-                result["code"] = "\n".join(lines)
+                        code_lines.append((getattr(instr, "address", None), str(instr)))
             else:
-                result["code"] = "MLIL not available for this function"
+                code_lines = [(None, "MLIL not available for this function")]
+            result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "llil":
             func.analysis_skipped = False
             self.bv.update_analysis_and_wait()
             if hasattr(func, 'llil') and func.llil:
-                lines = []
+                code_lines = []
                 for block in func.llil:
                     for instr in block:
-                        lines.append(f"{hex(instr.address)}: {instr}")
-                result["code"] = "\n".join(lines)
+                        code_lines.append((instr.address, f"{hex(instr.address)}: {instr}"))
             else:
-                result["code"] = "LLIL not available for this function"
+                code_lines = [(None, "LLIL not available for this function")]
+            result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "disasm":
-            lines = []
+            code_lines = []
             for block in func.basic_blocks:
                 for i in range(block.start, block.end):
                     disasm = self.bv.get_disassembly(i)
                     if disasm:
-                        lines.append(f"{hex(i)}: {disasm}")
-            result["code"] = "\n".join(lines)
+                        code_lines.append((i, f"{hex(i)}: {disasm}"))
+            result["code"] = self._format_code_with_context(func, code_lines)
 
         elif format == "pseudo_c":
             func.analysis_skipped = False
@@ -2319,19 +2369,16 @@ class BinAssistMCPTools:
             if hasattr(func, 'hlil') and func.hlil:
                 # Build pseudo-C representation
                 code_lines = []
-                params = ", ".join([
-                    f"{self._get_variable_type_safe(func, p)} {p.name}"
-                    for p in func.parameter_vars
-                ]) if func.parameter_vars else "void"
-                return_type = str(func.return_type) if func.return_type else "void"
-                code_lines.append(f"{return_type} {func.name}({params}) {{")
                 for block in func.hlil:
                     for instr in block:
-                        code_lines.append(f"    {instr}")
-                code_lines.append("}")
-                result["code"] = "\n".join(code_lines)
+                        code_lines.append((getattr(instr, "address", None), f"    {instr}"))
+                code_lines.append((None, "}"))
+                result["code"] = self._format_code_with_context(func, code_lines, " {")
             else:
-                result["code"] = "Pseudo-C not available (HLIL unavailable)"
+                result["code"] = self._format_code_with_context(
+                    func,
+                    [(None, "Pseudo-C not available (HLIL unavailable)")]
+                )
 
         else:
             raise ValueError(f"Unknown format: {format}. Valid: decompile, hlil, mlil, llil, disasm, pseudo_c")

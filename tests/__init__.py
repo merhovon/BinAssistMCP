@@ -1,0 +1,1 @@
+"""BinAssistMCP regression tests."""
