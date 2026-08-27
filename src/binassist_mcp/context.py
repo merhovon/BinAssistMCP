@@ -364,6 +364,30 @@ class BinAssistMCPBinaryContextManager:
 
         return binary_name, status
 
+    def _ensure_binary_registered(self, name: str) -> None:
+        """Lazily refresh Binary Ninja UI state when a cached binary is unavailable.
+
+        Some MCP clients create a new lifespan for each operation. Those lifespans
+        start with an empty context even though Binary Ninja still has open views,
+        so filename-based operations must not depend on list_binaries being called
+        first in the same session.
+        """
+        with self._lock:
+            binary_info = self._binaries.get(name)
+            if binary_info and self._is_binary_valid(binary_info.view):
+                return
+
+            if binary_info:
+                del self._binaries[name]
+                log.log_warn(f"Binary '{name}' is no longer valid, refreshing context")
+
+        sync_result = self.sync_with_binja()
+        if sync_result.get("error"):
+            log.log_debug(
+                f"Could not refresh Binary Ninja context for '{name}': "
+                f"{sync_result['error']}"
+            )
+
     def get_binary(self, name: str) -> object:
         """Get a BinaryView by name
 
@@ -376,6 +400,8 @@ class BinAssistMCPBinaryContextManager:
         Raises:
             KeyError: If the binary is not found
         """
+        self._ensure_binary_registered(name)
+
         with self._lock:
             if name not in self._binaries:
                 available = ", ".join(self._binaries.keys()) if self._binaries else "none"
@@ -403,6 +429,8 @@ class BinAssistMCPBinaryContextManager:
         Raises:
             KeyError: If the binary is not found
         """
+        self._ensure_binary_registered(name)
+
         with self._lock:
             if name not in self._binaries:
                 available = ", ".join(self._binaries.keys()) if self._binaries else "none"
@@ -492,6 +520,8 @@ class BinAssistMCPBinaryContextManager:
             "bndb_saved": False,
             "message": "",
         }
+
+        self._ensure_binary_registered(name)
 
         with self._lock:
             if name not in self._binaries:
