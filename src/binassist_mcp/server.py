@@ -603,6 +603,23 @@ class BinAssistMCPServer:
                     "error": str(e)
                 }
 
+        @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
+        def get_binary_status(filename: str, ctx: Context) -> dict:
+            """Check a queued open operation or a loaded binary.
+
+            Args:
+                filename: Operation ID returned by open_binary, final binary
+                          name, requested filename, or full file path.
+
+            Returns:
+                Open state and live analysis progress. The open state is one
+                of queued, opening, discovering, ready, failed, or not_found.
+                When ready, ``name`` is the final context name to use with
+                analysis tools.
+            """
+            context_manager: BinAssistMCPBinaryContextManager = ctx.request_context.lifespan_context
+            return context_manager.get_binary_status(filename)
+
         # Open binary tool - non-idempotent, modifies state
         OPEN_BINARY_ANNOTATIONS = {
             "readOnlyHint": False,
@@ -627,10 +644,12 @@ class BinAssistMCPServer:
             When opening an existing .bndb database file, bndb_path is not
             needed — the database is already saved on disk.
 
-            By default, this tool returns immediately after the binary is loaded
-            WITHOUT waiting for analysis to complete. Analysis runs in the
-            background. Use get_binary_status to check progress. The .bndb
-            database is saved automatically when analysis finishes.
+            By default, this tool queues the open and returns immediately with
+            an operation_id, without waiting for a large file or database to
+            finish loading. Call get_binary_status with that operation ID until
+            status is ready or failed. Once ready, use the returned name with
+            analysis tools. The .bndb database is saved automatically when
+            analysis finishes.
 
             IMPORTANT: While analysis is running, tools that query functions
             (decompile, get_functions, etc.) may return incomplete results.
@@ -648,7 +667,10 @@ class BinAssistMCPServer:
 
             Returns:
                 Dictionary with:
-                - name: The name assigned to this binary in the context (use this for other tools)
+                - operation_id: Identifier for polling get_binary_status
+                - status: Current open state
+                - name: Final context name; null until status is ready
+                - requested_name: Sanitized source filename
                 - file_path: Resolved absolute path of the opened file
                 - bndb_path: Path of the saved .bndb database
                 - analysis_complete: Whether analysis finished

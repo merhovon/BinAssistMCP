@@ -10,13 +10,14 @@ BinAssistMCP is a powerful bridge between Binary Ninja and Large Language Models
 
 - **MCP 2025-11-25 Compliant**: Full support for tool annotations, resources, and prompts
 - **Dual Transport Support**: SSE (Server-Sent Events) and Streamable HTTP transports
-- **44 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
+- **45 Consolidated Tools**: Streamlined Binary Ninja API wrapper with unified tool design
 - **8 MCP Resources**: Browsable, cacheable binary metadata
 - **7 Guided Prompts**: Pre-built workflows for common reverse engineering tasks
 - **Multi-Binary Sessions**: Concurrent analysis of multiple binaries with intelligent context management
 - **Context-Rich Code Output**: Function signatures and Binary Ninja comments are embedded in code results
 - **Analysis-Safe Queries**: Code retrieval uses already-loaded IL and never forces global reanalysis
 - **Session-Independent Discovery**: Direct tool calls discover open Binary Ninja views without requiring a prior listing call
+- **Nonblocking Binary Opens**: Large binaries and `.bndb` databases open asynchronously with pollable operation status
 - **Thread-Safe**: RLock-based synchronization for concurrent access
 - **Auto-Integration**: Seamless Binary Ninja plugin with automatic startup capabilities
 
@@ -35,7 +36,7 @@ BinAssistMCP is a powerful bridge between Binary Ninja and Large Language Models
 ```
 src/binassist_mcp/
 ├── server.py        # FastMCP server - SSE/Streamable HTTP transport, tool registration
-├── tools.py         # Binary Ninja API wrapper - 44 MCP tools
+├── tools.py         # Binary Ninja API wrapper - 45 MCP tools
 ├── plugin.py        # Binary Ninja plugin integration
 ├── context.py       # Thread-safe multi-binary session management
 ├── config.py        # Pydantic configuration with Binary Ninja settings
@@ -51,18 +52,21 @@ __init__.py          # Plugin entry point (root level)
 
 ---
 
-## Tools (44 Total)
+## Tools (45 Total)
 
-BinAssistMCP provides 44 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
+BinAssistMCP provides 45 tools organized into functional categories. Tools include MCP annotations (`readOnlyHint`, `idempotentHint`) to help clients make informed decisions.
 
 ### Binary Management
 | Tool | Description |
 |------|-------------|
 | `list_binaries` | Synchronize with Binary Ninja and list all loaded binary files |
 | `get_binary_info` | Check analysis status and metadata |
-| `open_binary` | Open a binary or existing `.bndb`; raw binaries require a destination `bndb_path` |
+| `get_binary_status` | Poll a queued open by operation ID, path, or name and report analysis progress |
+| `open_binary` | Queue a nonblocking binary or `.bndb` open; raw binaries require a destination `bndb_path` |
 | `update_analysis_and_wait` | Force analysis update and wait for completion |
 | `export_program` | Export the patched binary or Binary Ninja database to disk |
+
+By default, `open_binary` validates its paths, schedules the Binary Ninja open, and immediately returns an `operation_id` with `status="opening"`. Poll `get_binary_status(operation_id)` until it reports `ready` or `failed`. When ready, its `name` field is the final context name to pass to analysis tools. Concurrent requests for the same path reuse the active operation. Set `wait_for_analysis=true` only when legacy blocking behavior is explicitly required.
 
 ### Code Analysis (Consolidated)
 | Tool | Description |

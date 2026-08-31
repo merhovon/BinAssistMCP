@@ -5,10 +5,12 @@ This module provides context management for multiple Binary Ninja BinaryViews
 with automatic name deduplication and lifecycle management.
 """
 
+import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 from pathlib import Path
 
 from .logging import log
@@ -41,8 +43,52 @@ class BinaryInfo:
             self.bndb_path = Path(self.bndb_path)
 
 
+@dataclass
+class OpenOperation:
+    """State for a binary open that may outlive an MCP request."""
+
+    operation_id: str
+    file_path: str
+    bndb_path: Optional[str]
+    requested_name: str
+    status: str = "queued"
+    name: Optional[str] = None
+    analysis_complete: bool = False
+    function_count: int = 0
+    bndb_saved: bool = False
+    error: Optional[str] = None
+    message: str = "Binary open queued."
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        """Return a stable MCP response for this operation."""
+        return {
+            "operation_id": self.operation_id,
+            "status": self.status,
+            "name": self.name,
+            "requested_name": self.requested_name,
+            "file_path": self.file_path,
+            "bndb_path": self.bndb_path,
+            "analysis_complete": self.analysis_complete,
+            "function_count": self.function_count,
+            "bndb_saved": self.bndb_saved,
+            "error": self.error,
+            "message": self.message,
+        }
+
+
 class BinAssistMCPBinaryContextManager:
     """Context manager for multiple Binary Ninja BinaryViews"""
+
+    # Open operations are shared across context-manager instances because some
+    # MCP clients establish a fresh lifespan for each operation.
+    _open_operations: ClassVar[Dict[str, OpenOperation]] = {}
+    _active_open_paths: ClassVar[Dict[str, str]] = {}
+    _open_operations_lock: ClassVar[threading.RLock] = threading.RLock()
+    _max_open_operations: ClassVar[int] = 100
+    _view_discovery_timeout: ClassVar[float] = 30.0
+    _view_discovery_interval: ClassVar[float] = 0.5
     
     def __init__(self, max_binaries: int = 10):
         """Initialize the context manager
@@ -97,7 +143,7 @@ class BinAssistMCPBinaryContextManager:
             return unique_name
         
     def open_binary(self, file_path: str, bndb_path: Optional[str] = None,
-                    wait_for_analysis: bool = True) -> Tuple[str, dict]:
+                    wait_for_analysis: bool = True) -> Tuple[Optional[str], dict]:
         """Open a binary file or existing .bndb database in Binary Ninja.
 
         Uses the Binary Ninja UI to open the file (via UIContext.openFilename
@@ -111,11 +157,10 @@ class BinAssistMCPBinaryContextManager:
         For existing .bndb files: bndb_path is ignored — the database is
         already on disk and will be opened directly.
 
-        IMPORTANT: This method returns as soon as the BinaryView is available
-        in the context, WITHOUT waiting for analysis to complete. Analysis
-        runs in the background. Use get_analysis_progress() or
-        get_binary_status to check when analysis is done. This design
-        prevents blocking the MCP event loop during long analysis runs.
+        With wait_for_analysis=False, the open is queued and this method returns
+        immediately with an operation ID. Use get_binary_status() with that ID
+        to discover the final context name and monitor analysis. This avoids
+        blocking while Binary Ninja deserializes a large database.
 
         When wait_for_analysis=True (legacy behavior), this method will
         block until analysis completes. This is NOT recommended for large
@@ -134,7 +179,11 @@ class BinAssistMCPBinaryContextManager:
                                is saved automatically when analysis completes.
 
         Returns:
-            Tuple of (binary_name, status_dict) where status_dict contains:
+            Tuple of (binary_name, status_dict). For an asynchronous open,
+            binary_name is None until get_binary_status() reports ``ready``.
+            status_dict contains:
+            - operation_id: Identifier used to poll an asynchronous open
+            - status: queued, opening, discovering, ready, or failed
             - file_path: Path of the opened file
             - bndb_path: Path of the .bndb database (saved or pending)
             - analysis_complete: Whether analysis finished
@@ -182,12 +231,22 @@ class BinAssistMCPBinaryContextManager:
 
         # Determine if the UI is available
         ui_available = False
+        ui_context_type = None
         try:
             from binaryninjaui import UIContext
             if UIContext.allContexts():
                 ui_available = True
+                ui_context_type = UIContext
         except ImportError:
             pass
+
+        if not wait_for_analysis:
+            return self._queue_binary_open(
+                resolved_path=resolved_path,
+                resolved_bndb_path=resolved_bndb_path,
+                is_bndb=is_bndb,
+                ui_context_type=ui_context_type if ui_available else None,
+            )
 
         bv = None
 
@@ -362,7 +421,360 @@ class BinAssistMCPBinaryContextManager:
             f"analysis_complete={status['analysis_complete']})"
         )
 
+        status["operation_id"] = None
+        status["status"] = "ready"
+        status["message"] = f"Binary '{binary_name}' is ready."
         return binary_name, status
+
+    @staticmethod
+    def _path_key(file_path: str) -> str:
+        """Normalize a path for operation deduplication and view matching."""
+        try:
+            return os.path.normcase(str(Path(file_path).resolve()))
+        except Exception:
+            return os.path.normcase(str(file_path))
+
+    @classmethod
+    def _prune_open_operations(cls) -> None:
+        """Bound retained completed operation history."""
+        if len(cls._open_operations) < cls._max_open_operations:
+            return
+
+        completed = sorted(
+            (
+                operation for operation in cls._open_operations.values()
+                if operation.status in ("ready", "failed")
+            ),
+            key=lambda operation: operation.updated_at,
+        )
+        remove_count = len(cls._open_operations) - cls._max_open_operations + 1
+        for operation in completed[:remove_count]:
+            cls._open_operations.pop(operation.operation_id, None)
+
+    @classmethod
+    def _update_open_operation(cls, operation_id: str, **changes) -> Optional[dict]:
+        """Atomically update an open operation and return its snapshot."""
+        with cls._open_operations_lock:
+            operation = cls._open_operations.get(operation_id)
+            if operation is None:
+                return None
+
+            for key, value in changes.items():
+                setattr(operation, key, value)
+            operation.updated_at = time.time()
+
+            if operation.status in ("ready", "failed"):
+                path_key = cls._path_key(operation.file_path)
+                if cls._active_open_paths.get(path_key) == operation_id:
+                    cls._active_open_paths.pop(path_key, None)
+
+            return operation.to_dict()
+
+    @classmethod
+    def _get_open_operation(cls, identifier: str) -> Optional[OpenOperation]:
+        """Find an operation by ID, final name, requested name, or path."""
+        with cls._open_operations_lock:
+            direct = cls._open_operations.get(identifier)
+            if direct is not None:
+                return direct
+
+            path_key = cls._path_key(identifier)
+            candidates = sorted(
+                cls._open_operations.values(),
+                key=lambda operation: operation.created_at,
+                reverse=True,
+            )
+            for operation in candidates:
+                if identifier in (operation.name, operation.requested_name):
+                    return operation
+                if path_key == cls._path_key(operation.file_path):
+                    return operation
+            return None
+
+    def _queue_binary_open(self, resolved_path: str,
+                           resolved_bndb_path: Optional[Path],
+                           is_bndb: bool,
+                           ui_context_type: Optional[object]) -> Tuple[Optional[str], dict]:
+        """Queue a UI or headless open without waiting for file loading."""
+        path_key = self._path_key(resolved_path)
+        with self._open_operations_lock:
+            active_id = self._active_open_paths.get(path_key)
+            if active_id:
+                active = self._open_operations.get(active_id)
+                if active and active.status not in ("ready", "failed"):
+                    snapshot = active.to_dict()
+                    snapshot["message"] = "This binary is already being opened."
+                    return active.name, snapshot
+
+            self._prune_open_operations()
+            operation_id = str(uuid.uuid4())
+            operation = OpenOperation(
+                operation_id=operation_id,
+                file_path=resolved_path,
+                bndb_path=(
+                    resolved_path if is_bndb
+                    else str(resolved_bndb_path) if resolved_bndb_path else None
+                ),
+                requested_name=self._sanitize_name(Path(resolved_path).name),
+            )
+            self._open_operations[operation_id] = operation
+            self._active_open_paths[path_key] = operation_id
+
+        if ui_context_type is not None:
+            self._queue_ui_open(operation_id, ui_context_type)
+        else:
+            self._queue_headless_open(operation_id)
+
+        with self._open_operations_lock:
+            snapshot = self._open_operations[operation_id].to_dict()
+        return snapshot["name"], snapshot
+
+    def _queue_ui_open(self, operation_id: str, ui_context_type: object) -> None:
+        """Schedule UIContext.openFilename without waiting for it to return."""
+        operation = self._get_open_operation(operation_id)
+        if operation is None:
+            return
+
+        try:
+            from binaryninja.mainthread import execute_on_main_thread
+        except Exception as exc:
+            error = f"Could not access Binary Ninja's main-thread scheduler: {exc}"
+            log.log_warn(error)
+            self._update_open_operation(
+                operation_id,
+                status="failed",
+                error=error,
+                message=error,
+            )
+            return
+
+        self._update_open_operation(
+            operation_id,
+            status="opening",
+            message="Binary Ninja is opening the file in the UI.",
+        )
+
+        def _open_in_ui():
+            try:
+                contexts = ui_context_type.allContexts()
+                if not contexts:
+                    raise RuntimeError("no UI context is available")
+                if not contexts[0].openFilename(operation.file_path):
+                    raise RuntimeError("Binary Ninja rejected the file")
+            except Exception as exc:
+                error = f"Binary Ninja UI failed to open '{operation.file_path}': {exc}"
+                log.log_warn(error)
+                self._update_open_operation(
+                    operation_id,
+                    status="failed",
+                    error=error,
+                    message=error,
+                )
+                return
+
+            self._update_open_operation(
+                operation_id,
+                status="discovering",
+                message="The file is open; waiting for its BinaryView to appear.",
+            )
+            monitor = threading.Thread(
+                target=self._finalize_ui_open_operation,
+                args=(operation_id,),
+                name=f"binary-open-{operation_id[:8]}",
+                daemon=True,
+            )
+            monitor.start()
+
+        try:
+            execute_on_main_thread(_open_in_ui)
+        except Exception as exc:
+            error = f"Could not schedule Binary Ninja UI open: {exc}"
+            log.log_warn(error)
+            self._update_open_operation(
+                operation_id,
+                status="failed",
+                error=error,
+                message=error,
+            )
+
+    def _queue_headless_open(self, operation_id: str) -> None:
+        """Run the blocking bn.load call on a dedicated worker thread."""
+        self._update_open_operation(
+            operation_id,
+            status="opening",
+            message="Binary Ninja is opening the file headlessly.",
+        )
+        worker = threading.Thread(
+            target=self._open_headless_operation,
+            args=(operation_id,),
+            name=f"binary-open-{operation_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+
+    def _open_headless_operation(self, operation_id: str) -> None:
+        """Complete a queued headless open."""
+        operation = self._get_open_operation(operation_id)
+        if operation is None:
+            return
+
+        try:
+            bv = bn.load(operation.file_path)
+            if bv is None:
+                raise RuntimeError("Binary Ninja returned no BinaryView")
+            binary_name = self.add_binary(bv)
+            self._complete_open_operation(operation_id, binary_name, bv)
+        except Exception as exc:
+            error = f"Binary Ninja failed to load '{operation.file_path}': {exc}"
+            log.log_warn(error)
+            self._update_open_operation(
+                operation_id,
+                status="failed",
+                error=error,
+                message=error,
+            )
+
+    def _find_binary_by_path(self, file_path: str) -> Tuple[Optional[str], Optional[object]]:
+        """Return the registered name and view matching a resolved path."""
+        path_key = self._path_key(file_path)
+        with self._lock:
+            for name, info in self._binaries.items():
+                if info.file_path and self._path_key(str(info.file_path)) == path_key:
+                    return name, info.view
+        return None, None
+
+    def _finalize_ui_open_operation(self, operation_id: str) -> None:
+        """Discover and register a view after the UI open callback finishes."""
+        operation = self._get_open_operation(operation_id)
+        if operation is None:
+            return
+
+        deadline = time.monotonic() + self._view_discovery_timeout
+        while time.monotonic() < deadline:
+            self.sync_with_binja()
+            binary_name, bv = self._find_binary_by_path(operation.file_path)
+            if binary_name is not None and bv is not None:
+                self._complete_open_operation(operation_id, binary_name, bv)
+                return
+            time.sleep(self._view_discovery_interval)
+
+        error = (
+            f"Binary '{operation.file_path}' opened in the UI but its BinaryView "
+            f"did not appear within {self._view_discovery_timeout:g} seconds"
+        )
+        log.log_warn(error)
+        self._update_open_operation(
+            operation_id,
+            status="failed",
+            error=error,
+            message=error,
+        )
+
+    def _complete_open_operation(self, operation_id: str, binary_name: str,
+                                 bv: object) -> None:
+        """Attach the loaded view and mark an asynchronous open ready."""
+        operation = self._get_open_operation(operation_id)
+        if operation is None:
+            return
+
+        target_bndb = None
+        if operation.bndb_path and not operation.file_path.lower().endswith(".bndb"):
+            target_bndb = Path(operation.bndb_path)
+
+        with self._lock:
+            info = self._binaries.get(binary_name)
+            if info is not None and target_bndb is not None:
+                info.bndb_path = target_bndb
+
+        analysis_complete = self._is_analysis_complete(bv)
+        try:
+            function_count = len(bv.functions)
+        except Exception:
+            function_count = 0
+
+        self._update_open_operation(
+            operation_id,
+            status="ready",
+            name=binary_name,
+            analysis_complete=analysis_complete,
+            function_count=function_count,
+            bndb_saved=operation.file_path.lower().endswith(".bndb"),
+            message=(
+                f"Binary '{binary_name}' is ready."
+                if analysis_complete else
+                f"Binary '{binary_name}' is open and analysis is in progress."
+            ),
+        )
+
+        if analysis_complete and target_bndb is not None:
+            self._save_bndb_async(binary_name, bv, target_bndb)
+
+    def get_binary_status(self, identifier: str) -> dict:
+        """Get open and analysis status by operation ID, name, or file path."""
+        operation = self._get_open_operation(identifier)
+        if operation is not None:
+            if operation.status == "discovering":
+                self.sync_with_binja()
+                binary_name, bv = self._find_binary_by_path(operation.file_path)
+                if binary_name is not None and bv is not None:
+                    self._complete_open_operation(operation.operation_id, binary_name, bv)
+
+            if operation.status == "ready":
+                self.sync_with_binja()
+                binary_name, bv = self._find_binary_by_path(operation.file_path)
+                if binary_name is not None and bv is not None:
+                    if operation.bndb_path and not operation.file_path.lower().endswith(".bndb"):
+                        with self._lock:
+                            info = self._binaries.get(binary_name)
+                            if info is not None:
+                                info.bndb_path = Path(operation.bndb_path)
+                    progress = self.get_analysis_progress(binary_name)
+                    self._update_open_operation(
+                        operation.operation_id,
+                        name=binary_name,
+                        analysis_complete=progress["analysis_complete"],
+                        function_count=progress["function_count"],
+                        bndb_saved=progress["bndb_saved"],
+                        message=progress["message"],
+                    )
+
+            with self._open_operations_lock:
+                current = self._open_operations.get(operation.operation_id)
+                return current.to_dict() if current else {
+                    "operation_id": operation.operation_id,
+                    "status": "unknown",
+                    "error": "Open operation is no longer available",
+                }
+
+        # Compatibility path for binaries that were opened manually or by an
+        # earlier BinAssistMCP version.
+        try:
+            binary_info = self.get_binary_info(identifier)
+            progress = self.get_analysis_progress(identifier)
+            return {
+                "operation_id": None,
+                "status": "ready",
+                "name": binary_info.name,
+                "requested_name": binary_info.name,
+                "file_path": str(binary_info.file_path) if binary_info.file_path else None,
+                "bndb_path": str(binary_info.bndb_path) if binary_info.bndb_path else None,
+                "analysis_complete": progress["analysis_complete"],
+                "function_count": progress["function_count"],
+                "bndb_saved": progress["bndb_saved"],
+                "error": None,
+                "message": progress["message"],
+            }
+        except KeyError as exc:
+            return {
+                "operation_id": identifier,
+                "status": "not_found",
+                "name": None,
+                "analysis_complete": False,
+                "function_count": 0,
+                "bndb_saved": False,
+                "error": str(exc),
+                "message": str(exc),
+            }
 
     def _ensure_binary_registered(self, name: str) -> None:
         """Lazily refresh Binary Ninja UI state when a cached binary is unavailable.

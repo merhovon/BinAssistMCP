@@ -12,7 +12,7 @@ Features:
 - Binary Ninja plugin integration
 """
 
-__version__ = "2.10.0"
+__version__ = "2.11.0"
 __author__ = "Jason Tang"
 __description__ = "Comprehensive MCP server for Binary Ninja reverse engineering"
 
